@@ -1,0 +1,18 @@
+# Base packages installed into the agentvm base image.
+# One package name per line. Blank lines and comments are ignored.
+
+ca-certificates
+curl
+fd-find
+gh
+git
+jq
+make
+nodejs
+npm
+openssh-client
+python3
+python3-pip
+ripgrep
+unzip
+zip

@@ -5,6 +5,9 @@ TOOL_NAME="agentvm"
 BASE_INSTANCE="agentvm-base"
 BASE_SNAPSHOT="base"
 PROVISION_STAMP="/var/lib/agentvm/provisioned-v1"
+MANIFEST_HASH_FILE="/var/lib/agentvm/manifest.sha256"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_BASE_MANIFEST_DIR="${SCRIPT_DIR}/../manifests/base"
 
 usage() {
   cat <<USAGE
@@ -16,6 +19,7 @@ Usage:
   ${TOOL_NAME} run <claude|codex|opencode> [args...]
   ${TOOL_NAME} status
   ${TOOL_NAME} base init
+  ${TOOL_NAME} base apply
   ${TOOL_NAME} base shell
   ${TOOL_NAME} base snapshot
   ${TOOL_NAME} base reset
@@ -23,9 +27,10 @@ Usage:
 Environment:
   AGENTVM_BASE_INSTANCE              Base Lima instance name (default: ${BASE_INSTANCE})
   AGENTVM_BASE_SNAPSHOT              Snapshot name for base maintenance (default: ${BASE_SNAPSHOT})
+  AGENTVM_BASE_MANIFEST_DIR          Path to base manifest dir (default: ${DEFAULT_BASE_MANIFEST_DIR})
   AGENTVM_MOUNT_GH_CONFIG=0|1        Mount ~/.config/gh into VM (default: 1)
-  AGENTVM_MOUNT_GITCONFIG=0|1        Mount ~/.gitconfig into VM (default: 1)
-  AGENTVM_MOUNT_GIT_CREDENTIALS=0|1  Mount ~/.git-credentials into VM (default: 1 if file exists)
+  AGENTVM_MOUNT_GITCONFIG=0|1        Sync ~/.gitconfig into VM on each run (default: 1)
+  AGENTVM_MOUNT_GIT_CREDENTIALS=0|1  Sync ~/.git-credentials into VM on each run (default: 1 if file exists)
   AGENTVM_MOUNT_SSH=0|1              Mount ~/.ssh into VM (default: 0)
   AGENTVM_SKIP_AUTO_INSTALL=1        Do not auto-install agent CLIs when missing
   AGENTVM_<AGENT>_INSTALL_CMD        Override install command for missing CLI in VM
@@ -58,6 +63,87 @@ is_enabled() {
 instance_exists() {
   local name="$1"
   limactl list --format '{{.Name}}' 2>/dev/null | grep -Fxq "$name"
+}
+
+delete_instance() {
+  local name="$1"
+  limactl stop "$name" >/dev/null 2>&1 || true
+  limactl delete "$name" >/dev/null 2>&1 || limactl delete --force "$name" >/dev/null 2>&1 || limactl delete -f "$name" >/dev/null 2>&1 || die "Failed to delete broken instance: $name"
+}
+
+manifest_dir() {
+  if [ -n "${AGENTVM_BASE_MANIFEST_DIR:-}" ]; then
+    printf '%s\n' "$AGENTVM_BASE_MANIFEST_DIR"
+  else
+    printf '%s\n' "$DEFAULT_BASE_MANIFEST_DIR"
+  fi
+}
+
+manifest_hash() {
+  local dir="$1"
+  [ -d "$dir" ] || die "Manifest directory not found: $dir"
+
+  (
+    cd "$dir"
+    find . -type f | LC_ALL=C sort | while IFS= read -r file; do
+      printf '%s\0' "$file"
+      cat "$file"
+      printf '\0'
+    done
+  ) | shasum -a 256 | awk '{print $1}'
+}
+
+apply_base_manifest() {
+  local base="$1"
+  local dir hash current_hash packages_file scripts_dir script
+  local -a packages
+
+  dir="$(manifest_dir)"
+  hash="$(manifest_hash "$dir")"
+  current_hash="$(limactl shell "$base" bash -lc "cat '$MANIFEST_HASH_FILE' 2>/dev/null || true" | tr -d '\r\n')"
+
+  if [ "$hash" = "$current_hash" ] && limactl shell "$base" test -f "$PROVISION_STAMP" >/dev/null 2>&1; then
+    log "Base manifest already applied ($hash)"
+    return 0
+  fi
+
+  log "Applying base manifest from $dir"
+  limactl shell "$base" sudo mkdir -p "$(dirname "$PROVISION_STAMP")"
+
+  packages_file="$dir/apt-packages.txt"
+  if [ -f "$packages_file" ]; then
+    packages=()
+    while IFS= read -r pkg; do
+      [ -n "$pkg" ] && packages+=("$pkg")
+    done < <(awk '{sub(/[[:space:]]*#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); if (length) print}' "$packages_file")
+
+    if [ "${#packages[@]}" -gt 0 ]; then
+      log "Installing apt packages (${#packages[@]})"
+      limactl shell "$base" sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+      limactl shell "$base" sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+    fi
+  fi
+
+  scripts_dir="$dir/scripts"
+  if [ -d "$scripts_dir" ]; then
+    while IFS= read -r script; do
+      log "Running manifest script: $(basename "$script")"
+      limactl shell "$base" sudo bash -s -- < "$script"
+    done < <(find "$scripts_dir" -maxdepth 1 -type f -name '*.sh' | LC_ALL=C sort)
+  fi
+
+  limactl shell "$base" sudo bash -lc "printf '%s\n' '$hash' > '$MANIFEST_HASH_FILE'; touch '$PROVISION_STAMP'"
+  log "Base manifest applied ($hash)"
+}
+
+sync_host_file_to_guest_home() {
+  local instance="$1"
+  local host_path="$2"
+  local guest_rel_path="$3"
+  local mode="$4"
+
+  [ -f "$host_path" ] || return 0
+  limactl shell "$instance" bash -lc "cat > \"\$HOME/$guest_rel_path\" && chmod '$mode' \"\$HOME/$guest_rel_path\"" < "$host_path"
 }
 
 project_root() {
@@ -140,33 +226,7 @@ ensure_base_instance() {
 
   log "Starting base VM: $base"
   limactl start "$base" >/dev/null
-
-  if ! limactl shell "$base" test -f "$PROVISION_STAMP" >/dev/null 2>&1; then
-    log "Provisioning base VM tools"
-    limactl shell "$base" sudo mkdir -p "$(dirname "$PROVISION_STAMP")"
-    limactl shell "$base" sudo bash -lc '
-      set -euo pipefail
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update
-      apt-get install -y \
-        ca-certificates \
-        curl \
-        fd-find \
-        git \
-        jq \
-        make \
-        nodejs \
-        npm \
-        openssh-client \
-        python3 \
-        python3-pip \
-        ripgrep \
-        unzip \
-        zip
-      apt-get install -y gh || true
-    '
-    limactl shell "$base" sudo touch "$PROVISION_STAMP"
-  fi
+  apply_base_manifest "$base"
 }
 
 ensure_project_instance() {
@@ -175,7 +235,8 @@ ensure_project_instance() {
   local base="${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
   local home_dir="$HOME"
   local -a mount_args
-  local mount_gh_config=0 mount_gitconfig=0 mount_git_credentials=0 mount_ssh=0
+  local mount_gh_config=0 mount_ssh=0 sync_gitconfig=0 sync_git_credentials=0
+  local needs_create=0
 
   mkdir -p "$home_dir/.claude" "$home_dir/.codex" "$home_dir/.config/opencode" "$home_dir/.config/gh"
   mount_args+=(
@@ -191,13 +252,11 @@ ensure_project_instance() {
   fi
 
   if is_enabled "${AGENTVM_MOUNT_GITCONFIG:-1}" && [ -f "$home_dir/.gitconfig" ]; then
-    mount_gitconfig=1
-    mount_args+=(--mount-only "$home_dir/.gitconfig")
+    sync_gitconfig=1
   fi
 
   if is_enabled "${AGENTVM_MOUNT_GIT_CREDENTIALS:-1}" && [ -f "$home_dir/.git-credentials" ]; then
-    mount_git_credentials=1
-    mount_args+=(--mount-only "$home_dir/.git-credentials")
+    sync_git_credentials=1
   fi
 
   if is_enabled "${AGENTVM_MOUNT_SSH:-0}" && [ -d "$home_dir/.ssh" ]; then
@@ -206,20 +265,30 @@ ensure_project_instance() {
   fi
 
   if ! instance_exists "$instance"; then
+    needs_create=1
+  fi
+
+  if [ "$needs_create" -eq 0 ]; then
+    limactl start "$instance" >/dev/null
+    if ! limactl shell "$instance" test -d "$root" >/dev/null 2>&1; then
+      log "Existing VM '$instance' is missing project mount '$root'; recreating it"
+      delete_instance "$instance"
+      needs_create=1
+    fi
+  fi
+
+  if [ "$needs_create" -eq 1 ]; then
     ensure_base_instance
     log "Stopping base VM before cloning"
     limactl stop "$base" >/dev/null 2>&1 || true
     log "Cloning $base -> $instance"
     limactl clone "${mount_args[@]}" "$base" "$instance"
+    limactl start "$instance" >/dev/null
   fi
-
-  limactl start "$instance" >/dev/null
 
   limactl shell "$instance" env \
     AGENTVM_HOST_HOME="$home_dir" \
     AGENTVM_LINK_GH_CONFIG="$mount_gh_config" \
-    AGENTVM_LINK_GITCONFIG="$mount_gitconfig" \
-    AGENTVM_LINK_GIT_CREDENTIALS="$mount_git_credentials" \
     AGENTVM_LINK_SSH="$mount_ssh" \
     bash -lc '
     set -euo pipefail
@@ -232,17 +301,18 @@ ensure_project_instance() {
       mkdir -p "$HOME/.config"
       ln -sfn "$AGENTVM_HOST_HOME/.config/gh" "$HOME/.config/gh"
     fi
-    if [ "$AGENTVM_LINK_GITCONFIG" = "1" ]; then
-      ln -sfn "$AGENTVM_HOST_HOME/.gitconfig" "$HOME/.gitconfig"
-    fi
-    if [ "$AGENTVM_LINK_GIT_CREDENTIALS" = "1" ]; then
-      ln -sfn "$AGENTVM_HOST_HOME/.git-credentials" "$HOME/.git-credentials"
-    fi
     if [ "$AGENTVM_LINK_SSH" = "1" ]; then
       ln -sfn "$AGENTVM_HOST_HOME/.ssh" "$HOME/.ssh"
       chmod 700 "$HOME/.ssh" || true
     fi
   '
+
+  if [ "$sync_gitconfig" = "1" ]; then
+    sync_host_file_to_guest_home "$instance" "$home_dir/.gitconfig" ".gitconfig" 0600
+  fi
+  if [ "$sync_git_credentials" = "1" ]; then
+    sync_host_file_to_guest_home "$instance" "$home_dir/.git-credentials" ".git-credentials" 0600
+  fi
 }
 
 ensure_agent_in_instance() {
@@ -358,6 +428,11 @@ base_init() {
   log "Base VM ready: ${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
 }
 
+base_apply() {
+  ensure_base_instance
+  log "Base manifest apply complete"
+}
+
 base_shell() {
   local base="${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
   ensure_base_instance
@@ -415,6 +490,7 @@ main() {
       shift
       case "${1:-}" in
         init) base_init ;;
+        apply) base_apply ;;
         shell) base_shell ;;
         snapshot) base_snapshot ;;
         reset) base_reset ;;

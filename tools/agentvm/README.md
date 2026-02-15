@@ -13,8 +13,8 @@
   - `~/.config/opencode`
 - Mounts GitHub auth/config for git + `gh` workflows:
   - `~/.config/gh` (default on)
-  - `~/.gitconfig` (default on, if present)
-  - `~/.git-credentials` (default on, if present)
+  - `~/.gitconfig` (synced into VM on each run, default on if present)
+  - `~/.git-credentials` (synced into VM on each run, default on if present)
   - `~/.ssh` (optional, opt-in)
 - Runs the chosen agent inside the VM with best-effort yolo flags.
 - Leaves Lima port forwarding defaults intact so localhost dev servers are reachable from host.
@@ -97,7 +97,8 @@ agentvm gh auth status
 5. Optional: edit the base image and save it:
 
 ```bash
-agentvm base shell
+vim tools/agentvm/manifests/base/apt-packages.txt
+agentvm base apply
 agentvm base snapshot
 ```
 
@@ -115,6 +116,7 @@ Core commands:
 Base image commands:
 
 - `agentvm base init`
+- `agentvm base apply`
 - `agentvm base shell`
 - `agentvm base snapshot`
 - `agentvm base reset`
@@ -153,6 +155,7 @@ agentvm status
 ## Behavior notes
 
 - First run is slower (base provisioning + project VM clone + optional agent install).
+- Base image provisioning is manifest-driven; edit files under `tools/agentvm/manifests/base`.
 - If an agent CLI is missing in the VM, `agentvm` auto-installs with npm by default.
 - To disable auto install, set `AGENTVM_SKIP_AUTO_INSTALL=1`.
 - To override install command for a given CLI:
@@ -161,6 +164,23 @@ agentvm status
   - `AGENTVM_OPENCODE_INSTALL_CMD`
 - To override `gh` install command:
   - `AGENTVM_GH_INSTALL_CMD`
+
+## Base Manifest
+
+Default manifest path:
+
+- `tools/agentvm/manifests/base/apt-packages.txt`
+- `tools/agentvm/manifests/base/scripts/*.sh` (run in lexical order as root)
+
+Workflow:
+
+1. Edit package/script manifest files.
+2. Run `agentvm base apply`.
+3. Run `agentvm base snapshot` to persist the updated baseline.
+
+Use a custom manifest location with:
+
+- `AGENTVM_BASE_MANIFEST_DIR=/path/to/manifest`
 
 ## GitHub access
 
@@ -188,7 +208,7 @@ export AGENTVM_MOUNT_SSH=1
 
 This mounts `~/.ssh` into the VM. Use only if you want SSH-key git auth inside the guest and are comfortable exposing host keys to the VM.
 
-Mount toggles:
+Mount/sync toggles:
 
 - `AGENTVM_MOUNT_GH_CONFIG` (default `1`)
 - `AGENTVM_MOUNT_GITCONFIG` (default `1`)
