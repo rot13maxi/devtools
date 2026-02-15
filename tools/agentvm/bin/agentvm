@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOL_NAME="agentvm"
+BASE_INSTANCE="agentvm-base"
+BASE_SNAPSHOT="base"
+PROVISION_STAMP="/var/lib/agentvm/provisioned-v1"
+
+usage() {
+  cat <<USAGE
+Usage:
+  ${TOOL_NAME} claude [args...]
+  ${TOOL_NAME} codex [args...]
+  ${TOOL_NAME} opencode [args...]
+  ${TOOL_NAME} gh [args...]
+  ${TOOL_NAME} run <claude|codex|opencode> [args...]
+  ${TOOL_NAME} status
+  ${TOOL_NAME} base init
+  ${TOOL_NAME} base shell
+  ${TOOL_NAME} base snapshot
+  ${TOOL_NAME} base reset
+
+Environment:
+  AGENTVM_BASE_INSTANCE              Base Lima instance name (default: ${BASE_INSTANCE})
+  AGENTVM_BASE_SNAPSHOT              Snapshot name for base maintenance (default: ${BASE_SNAPSHOT})
+  AGENTVM_MOUNT_GH_CONFIG=0|1        Mount ~/.config/gh into VM (default: 1)
+  AGENTVM_MOUNT_GITCONFIG=0|1        Mount ~/.gitconfig into VM (default: 1)
+  AGENTVM_MOUNT_GIT_CREDENTIALS=0|1  Mount ~/.git-credentials into VM (default: 1 if file exists)
+  AGENTVM_MOUNT_SSH=0|1              Mount ~/.ssh into VM (default: 0)
+  AGENTVM_SKIP_AUTO_INSTALL=1        Do not auto-install agent CLIs when missing
+  AGENTVM_<AGENT>_INSTALL_CMD        Override install command for missing CLI in VM
+                                     Agents: CLAUDE, CODEX, OPENCODE
+  AGENTVM_GH_INSTALL_CMD             Override install command for missing gh CLI in VM
+USAGE
+}
+
+log() {
+  printf '[agentvm] %s\n' "$*" >&2
+}
+
+die() {
+  printf '[agentvm] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_bin() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required binary: $1"
+}
+
+is_enabled() {
+  local value="${1:-0}"
+  case "$value" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+instance_exists() {
+  local name="$1"
+  limactl list --format '{{.Name}}' 2>/dev/null | grep -Fxq "$name"
+}
+
+project_root() {
+  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+    git rev-parse --show-toplevel
+  else
+    pwd
+  fi
+}
+
+project_instance_name() {
+  local root="$1"
+  local slug hash
+  slug="$(basename "$root" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')"
+  slug="${slug#-}"
+  slug="${slug%-}"
+  [ -n "$slug" ] || slug="project"
+  hash="$(printf '%s' "$root" | shasum -a 256 | awk '{print substr($1,1,10)}')"
+  printf 'agentvm-%s-%s\n' "$slug" "$hash"
+}
+
+agent_install_cmd() {
+  local agent="$1"
+  case "$agent" in
+    claude)
+      printf '%s\n' "
+        sudo npm install -g @anthropic-ai/claude-code
+      "
+      ;;
+    codex)
+      printf '%s\n' "
+        sudo npm install -g @openai/codex
+      "
+      ;;
+    opencode)
+      printf '%s\n' "
+        sudo npm install -g opencode-ai
+      "
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+supports_flag() {
+  local instance="$1"
+  local agent="$2"
+  local flag="$3"
+
+  limactl shell "$instance" bash -lc "command -v '$agent' >/dev/null 2>&1 && '$agent' --help 2>&1 | grep -Fq -- '$flag'"
+}
+
+yolo_flags_for_agent() {
+  local instance="$1"
+  local agent="$2"
+  local flags=()
+  local candidate=""
+
+  case "$agent" in
+    claude) candidate="--dangerously-skip-permissions" ;;
+    codex) candidate="--dangerously-bypass-approvals-and-sandbox" ;;
+    opencode) candidate="--yolo" ;;
+  esac
+
+  if [ -n "$candidate" ] && supports_flag "$instance" "$agent" "$candidate"; then
+    flags+=("$candidate")
+  fi
+
+  printf '%s\n' "${flags[@]:-}"
+}
+
+ensure_base_instance() {
+  local base="${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
+
+  if ! instance_exists "$base"; then
+    log "Creating base VM: $base"
+    limactl create --name "$base" --mount-none template://default
+  fi
+
+  log "Starting base VM: $base"
+  limactl start "$base" >/dev/null
+
+  if ! limactl shell "$base" test -f "$PROVISION_STAMP" >/dev/null 2>&1; then
+    log "Provisioning base VM tools"
+    limactl shell "$base" sudo mkdir -p "$(dirname "$PROVISION_STAMP")"
+    limactl shell "$base" sudo bash -lc '
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y \
+        ca-certificates \
+        curl \
+        fd-find \
+        git \
+        jq \
+        make \
+        nodejs \
+        npm \
+        openssh-client \
+        python3 \
+        python3-pip \
+        ripgrep \
+        unzip \
+        zip
+      apt-get install -y gh || true
+    '
+    limactl shell "$base" sudo touch "$PROVISION_STAMP"
+  fi
+}
+
+ensure_project_instance() {
+  local instance="$1"
+  local root="$2"
+  local base="${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
+  local home_dir="$HOME"
+  local -a mount_args
+  local mount_gh_config=0 mount_gitconfig=0 mount_git_credentials=0 mount_ssh=0
+
+  mkdir -p "$home_dir/.claude" "$home_dir/.codex" "$home_dir/.config/opencode" "$home_dir/.config/gh"
+  mount_args+=(
+    --mount-only "$root"
+    --mount-only "$home_dir/.claude"
+    --mount-only "$home_dir/.codex"
+    --mount-only "$home_dir/.config/opencode"
+  )
+
+  if is_enabled "${AGENTVM_MOUNT_GH_CONFIG:-1}"; then
+    mount_gh_config=1
+    mount_args+=(--mount-only "$home_dir/.config/gh")
+  fi
+
+  if is_enabled "${AGENTVM_MOUNT_GITCONFIG:-1}" && [ -f "$home_dir/.gitconfig" ]; then
+    mount_gitconfig=1
+    mount_args+=(--mount-only "$home_dir/.gitconfig")
+  fi
+
+  if is_enabled "${AGENTVM_MOUNT_GIT_CREDENTIALS:-1}" && [ -f "$home_dir/.git-credentials" ]; then
+    mount_git_credentials=1
+    mount_args+=(--mount-only "$home_dir/.git-credentials")
+  fi
+
+  if is_enabled "${AGENTVM_MOUNT_SSH:-0}" && [ -d "$home_dir/.ssh" ]; then
+    mount_ssh=1
+    mount_args+=(--mount-only "$home_dir/.ssh")
+  fi
+
+  if ! instance_exists "$instance"; then
+    ensure_base_instance
+    log "Stopping base VM before cloning"
+    limactl stop "$base" >/dev/null 2>&1 || true
+    log "Cloning $base -> $instance"
+    limactl clone "${mount_args[@]}" "$base" "$instance"
+  fi
+
+  limactl start "$instance" >/dev/null
+
+  limactl shell "$instance" env \
+    AGENTVM_HOST_HOME="$home_dir" \
+    AGENTVM_LINK_GH_CONFIG="$mount_gh_config" \
+    AGENTVM_LINK_GITCONFIG="$mount_gitconfig" \
+    AGENTVM_LINK_GIT_CREDENTIALS="$mount_git_credentials" \
+    AGENTVM_LINK_SSH="$mount_ssh" \
+    bash -lc '
+    set -euo pipefail
+    mkdir -p "$HOME/.config"
+    ln -sfn "$AGENTVM_HOST_HOME/.claude" "$HOME/.claude"
+    ln -sfn "$AGENTVM_HOST_HOME/.codex" "$HOME/.codex"
+    mkdir -p "$HOME/.config"
+    ln -sfn "$AGENTVM_HOST_HOME/.config/opencode" "$HOME/.config/opencode"
+    if [ "$AGENTVM_LINK_GH_CONFIG" = "1" ]; then
+      mkdir -p "$HOME/.config"
+      ln -sfn "$AGENTVM_HOST_HOME/.config/gh" "$HOME/.config/gh"
+    fi
+    if [ "$AGENTVM_LINK_GITCONFIG" = "1" ]; then
+      ln -sfn "$AGENTVM_HOST_HOME/.gitconfig" "$HOME/.gitconfig"
+    fi
+    if [ "$AGENTVM_LINK_GIT_CREDENTIALS" = "1" ]; then
+      ln -sfn "$AGENTVM_HOST_HOME/.git-credentials" "$HOME/.git-credentials"
+    fi
+    if [ "$AGENTVM_LINK_SSH" = "1" ]; then
+      ln -sfn "$AGENTVM_HOST_HOME/.ssh" "$HOME/.ssh"
+      chmod 700 "$HOME/.ssh" || true
+    fi
+  '
+}
+
+ensure_agent_in_instance() {
+  local instance="$1"
+  local agent="$2"
+  local env_key install_cmd
+
+  if limactl shell "$instance" command -v "$agent" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ "${AGENTVM_SKIP_AUTO_INSTALL:-0}" = "1" ]; then
+    die "'$agent' not found in VM '$instance'. Run '${TOOL_NAME} base shell' to install it."
+  fi
+
+  case "$agent" in
+    claude) env_key="AGENTVM_CLAUDE_INSTALL_CMD" ;;
+    codex) env_key="AGENTVM_CODEX_INSTALL_CMD" ;;
+    opencode) env_key="AGENTVM_OPENCODE_INSTALL_CMD" ;;
+    *) die "Unsupported agent: $agent" ;;
+  esac
+
+  install_cmd="${!env_key:-}"
+  if [ -z "$install_cmd" ]; then
+    install_cmd="$(agent_install_cmd "$agent")"
+  fi
+
+  log "Installing missing '$agent' CLI in '$instance'"
+  limactl shell "$instance" bash -lc "$install_cmd"
+
+  limactl shell "$instance" command -v "$agent" >/dev/null 2>&1 || die "Failed to install '$agent' in '$instance'"
+}
+
+ensure_gh_in_instance() {
+  local instance="$1"
+  local install_cmd
+
+  if limactl shell "$instance" command -v gh >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ "${AGENTVM_SKIP_AUTO_INSTALL:-0}" = "1" ]; then
+    die "'gh' not found in VM '$instance'. Run '${TOOL_NAME} base shell' to install it."
+  fi
+
+  install_cmd="${AGENTVM_GH_INSTALL_CMD:-sudo apt-get update && sudo apt-get install -y gh}"
+  log "Installing missing 'gh' CLI in '$instance'"
+  limactl shell "$instance" bash -lc "$install_cmd"
+  limactl shell "$instance" command -v gh >/dev/null 2>&1 || die "Failed to install 'gh' in '$instance'"
+}
+
+run_agent() {
+  local agent="$1"
+  shift || true
+
+  case "$agent" in
+    claude|codex|opencode) ;;
+    *) die "Unsupported agent: $agent" ;;
+  esac
+
+  local root instance cwd_in_guest
+  root="$(project_root)"
+  instance="$(project_instance_name "$root")"
+  cwd_in_guest="$(pwd)"
+
+  ensure_project_instance "$instance" "$root"
+  ensure_agent_in_instance "$instance" "$agent"
+
+  local yolo_flag
+  yolo_flag="$(yolo_flags_for_agent "$instance" "$agent")"
+
+  log "Using VM: $instance"
+  log "Project mount: $root"
+
+  if [ -n "$yolo_flag" ]; then
+    limactl shell --workdir "$cwd_in_guest" "$instance" "$agent" "$yolo_flag" "$@"
+  else
+    limactl shell --workdir "$cwd_in_guest" "$instance" "$agent" "$@"
+  fi
+}
+
+run_gh() {
+  local root instance cwd_in_guest
+  root="$(project_root)"
+  instance="$(project_instance_name "$root")"
+  cwd_in_guest="$(pwd)"
+
+  ensure_project_instance "$instance" "$root"
+  ensure_gh_in_instance "$instance"
+
+  log "Using VM: $instance"
+  log "Project mount: $root"
+  limactl shell --workdir "$cwd_in_guest" "$instance" gh "$@"
+}
+
+show_status() {
+  local root instance
+  root="$(project_root)"
+  instance="$(project_instance_name "$root")"
+
+  printf 'project_root=%s\n' "$root"
+  printf 'instance=%s\n' "$instance"
+
+  if instance_exists "$instance"; then
+    limactl list "$instance"
+  else
+    printf 'instance_status=missing\n'
+  fi
+}
+
+base_init() {
+  ensure_base_instance
+  log "Base VM ready: ${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
+}
+
+base_shell() {
+  local base="${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
+  ensure_base_instance
+  log "Opening shell in $base"
+  limactl shell "$base"
+}
+
+base_snapshot() {
+  local base="${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
+  local snap="${AGENTVM_BASE_SNAPSHOT:-$BASE_SNAPSHOT}"
+
+  ensure_base_instance
+  limactl stop "$base" >/dev/null 2>&1 || true
+  log "Refreshing base snapshot '$snap'"
+  limactl snapshot delete "$base" "$snap" >/dev/null 2>&1 || true
+  limactl snapshot create "$base" "$snap"
+}
+
+base_reset() {
+  local base="${AGENTVM_BASE_INSTANCE:-$BASE_INSTANCE}"
+  local snap="${AGENTVM_BASE_SNAPSHOT:-$BASE_SNAPSHOT}"
+
+  instance_exists "$base" || die "Base VM '$base' does not exist"
+  limactl stop "$base" >/dev/null 2>&1 || true
+  log "Restoring base VM from snapshot '$snap'"
+  limactl snapshot apply "$base" "$snap"
+  log "Base VM reset complete"
+}
+
+main() {
+  require_bin limactl
+  require_bin shasum
+
+  local cmd="${1:-}"
+  case "$cmd" in
+    claude|codex|opencode)
+      shift
+      run_agent "$cmd" "$@"
+      ;;
+    gh)
+      shift
+      run_gh "$@"
+      ;;
+    run)
+      shift
+      [ "${1:-}" ] || die "Usage: ${TOOL_NAME} run <claude|codex|opencode> [args...]"
+      local agent="$1"
+      shift
+      run_agent "$agent" "$@"
+      ;;
+    status)
+      show_status
+      ;;
+    base)
+      shift
+      case "${1:-}" in
+        init) base_init ;;
+        shell) base_shell ;;
+        snapshot) base_snapshot ;;
+        reset) base_reset ;;
+        *) usage; exit 1 ;;
+      esac
+      ;;
+    -h|--help|help|"")
+      usage
+      ;;
+    *)
+      usage
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
