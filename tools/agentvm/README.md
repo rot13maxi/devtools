@@ -16,7 +16,7 @@
   - `~/.gitconfig` (synced into VM on each run, default on if present)
   - `~/.git-credentials` (synced into VM on each run, default on if present)
   - `~/.ssh` (optional, opt-in)
-- Runs the chosen agent inside the VM with best-effort yolo flags.
+- Runs the chosen agent inside the VM (optional yolo flags via `AGENTVM_YOLO=1`).
 - Leaves Lima port forwarding defaults intact so localhost dev servers are reachable from host.
 
 ## Prerequisites
@@ -112,6 +112,11 @@ Core commands:
 - `agentvm run <claude|codex|opencode> [args...]`
 - `agentvm gh [args...]`
 - `agentvm status`
+- `agentvm list`
+- `agentvm rm [instance]`
+- `agentvm prune`
+- `agentvm doctor`
+- `agentvm install-shims [dir]`
 
 Base image commands:
 
@@ -152,11 +157,38 @@ Show VM mapping for current project:
 agentvm status
 ```
 
+List all agentvm VMs:
+
+```bash
+agentvm list
+```
+
+Delete current project VM:
+
+```bash
+agentvm rm
+```
+
+Prune stopped project VMs:
+
+```bash
+agentvm prune
+```
+
+Run health checks:
+
+```bash
+agentvm doctor
+```
+
 ## Behavior notes
 
 - First run is slower (base provisioning + project VM clone + optional agent install).
 - Base image provisioning is manifest-driven; edit files under `tools/agentvm/manifests/base`.
 - If an agent CLI is missing in the VM, `agentvm` auto-installs with npm by default.
+- Dangerous bypass flags are opt-in only (`AGENTVM_YOLO=1`).
+- If mount policy toggles change (`AGENTVM_MOUNT_GH_CONFIG`, `AGENTVM_MOUNT_SSH`), existing project VMs are recreated automatically to apply the new mount set.
+- `~/.gitconfig` and `~/.git-credentials` are synced when enabled and cleaned up from guest when disabled/missing.
 - To disable auto install, set `AGENTVM_SKIP_AUTO_INSTALL=1`.
 - To override install command for a given CLI:
   - `AGENTVM_CLAUDE_INSTALL_CMD`
@@ -214,7 +246,24 @@ Mount/sync toggles:
 - `AGENTVM_MOUNT_GITCONFIG` (default `1`)
 - `AGENTVM_MOUNT_GIT_CREDENTIALS` (default `1`)
 - `AGENTVM_MOUNT_SSH` (default `0`)
+- `AGENTVM_YOLO` (default `0`)
 
 ## Network / dev servers
 
 With Lima default port forwarding, services bound in VM are typically reachable from host on `127.0.0.1:<port>`. If a tool binds to VM-only interfaces, bind explicitly to `0.0.0.0` or `127.0.0.1` inside the guest.
+
+## Testing
+
+Unit-style tests (fake `limactl`):
+
+```bash
+just agentvm-test
+```
+
+Real Lima integration smoke test (opt-in):
+
+```bash
+AGENTVM_RUN_INTEGRATION_SMOKE=1 just agentvm-integration-smoke
+```
+
+The integration smoke test uses isolated `agentvm` instance names and cleans them up automatically.

@@ -1,0 +1,1 @@
+# integration smoke: keep empty so test does not depend on apt/network
