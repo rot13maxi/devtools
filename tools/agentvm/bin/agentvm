@@ -355,12 +355,13 @@ ensure_project_instance() {
 
   acquire_lock "project:$instance"
 
-  mkdir -p "$home_dir/.claude" "$home_dir/.codex" "$home_dir/.config/opencode" "$home_dir/.config/gh"
+  mkdir -p "$home_dir/.claude" "$home_dir/.codex" "$home_dir/.config/opencode" "$home_dir/.config/gh" "$home_dir/.config/claude"
   mount_args+=(
     --mount-only "$root"
     --mount-only "$home_dir/.claude"
     --mount-only "$home_dir/.codex"
     --mount-only "$home_dir/.config/opencode"
+    --mount-only "$home_dir/.config/claude"
   )
 
   if is_enabled "${AGENTVM_MOUNT_GH_CONFIG:-1}"; then
@@ -456,6 +457,8 @@ ensure_project_instance() {
     ln -sfn "$AGENTVM_HOST_HOME/.codex" "$HOME/.codex"
     mkdir -p "$HOME/.config"
     ln -sfn "$AGENTVM_HOST_HOME/.config/opencode" "$HOME/.config/opencode"
+    mkdir -p "$HOME/.config"
+    ln -sfn "$AGENTVM_HOST_HOME/.config/claude" "$HOME/.config/claude"
     if [ "$AGENTVM_LINK_GH_CONFIG" = "1" ]; then
       mkdir -p "$HOME/.config"
       ln -sfn "$AGENTVM_HOST_HOME/.config/gh" "$HOME/.config/gh"
